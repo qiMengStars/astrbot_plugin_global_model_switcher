@@ -33,21 +33,38 @@ NON_CHAT_PROVIDER_TYPES = {
 
 def _extract_models(models_raw: Any, fallback_model: Any = None) -> List[str]:
   """提取配置或运行时实例中启用的模型名称列表。"""
-  models: List[str] = []
+  seen: Set[str] = set()
+  result: List[str] = []
+
+  def _append_model(name: Any) -> None:
+    if name is None:
+      return
+    cleaned = str(name).strip()
+    if cleaned and cleaned not in seen:
+      seen.add(cleaned)
+      result.append(cleaned)
+
   if isinstance(models_raw, list):
     for item in models_raw:
       if isinstance(item, dict) and item.get("enable", True):
-        m_id = item.get("model_id") or item.get("name") or item.get("id")
-        if m_id:
-          models.append(str(m_id).strip())
-      elif isinstance(item, str) and item.strip():
-        models.append(item.strip())
-  elif isinstance(models_raw, str) and models_raw.strip():
-    models.append(models_raw.strip())
+        m_id = (
+            item.get("model_id")
+            or item.get("name")
+            or item.get("id")
+            or item.get("model")
+        )
+        _append_model(m_id)
+      elif isinstance(item, str):
+        _append_model(item)
+  elif isinstance(models_raw, str):
+    _append_model(models_raw)
 
-  if not models and fallback_model:
-    models.append(str(fallback_model).strip())
-  return models
+  if not result and fallback_model is not None:
+    if isinstance(fallback_model, (list, dict)):
+      return _extract_models(fallback_model)
+    _append_model(fallback_model)
+
+  return result
 
 
 def _find_target_provider(
@@ -106,7 +123,7 @@ def _build_success_message(target_p: Dict[str, Any], old_id: str) -> str:
     "astrbot_plugin_global_model_switcher",
     "xixi",
     "AstrBot 全局 LLM 动态热切换插件",
-    "1.0.0",
+    "1.0.1",
     "https://github.com/xixil/astrbot_plugin_global_model_switcher",
 )
 class GlobalModelSwitcherPlugin(Star):
@@ -122,6 +139,7 @@ class GlobalModelSwitcherPlugin(Star):
     super().__init__(context)
     self.context: Context = context
     self.plugin_config: Dict[str, Any] = config or {}
+    self._lock: asyncio.Lock = asyncio.Lock()
     logger.info("[GlobalModelSwitcher] 全局模型切换插件已成功加载")
 
   def _is_chat_provider(self, provider_type: str) -> bool:
@@ -155,10 +173,13 @@ class GlobalModelSwitcherPlugin(Star):
       if not self._is_chat_provider(p_type):
         continue
       seen_ids.add(p_id)
+      models = _extract_models(item.get("models"), item.get("model"))
+      if not models and "/" in p_id:
+        models = [p_id.split("/", 1)[1]]
       result.append({
           "id": p_id,
           "type": p_type,
-          "models": _extract_models(item.get("models"), item.get("model")),
+          "models": models,
           "enable": True,
       })
     return result
@@ -180,30 +201,49 @@ class GlobalModelSwitcherPlugin(Star):
     result: List[Dict[str, Any]] = []
     for p in instances:
       meta = p.meta() if hasattr(p, "meta") and callable(p.meta) else None
+      meta_id = meta.get("id") if isinstance(meta, dict) else getattr(meta, "id", None)
+      p_cfg = getattr(p, "provider_config", None) or {}
       p_id = (
-          getattr(meta, "id", None)
+          meta_id
           or getattr(p, "provider_id", None)
           or getattr(p, "id", None)
+          or p_cfg.get("id")
+          or p_cfg.get("provider_id")
       )
       if not p_id:
         continue
       clean_id = str(p_id).strip()
+      is_enabled = getattr(p, "enable", None)
+      if is_enabled is None:
+        is_enabled = p_cfg.get("enable", True)
       if (
           clean_id in seen_ids
           or clean_id in disabled_ids
-          or not getattr(p, "enable", True)
+          or not is_enabled
       ):
         continue
-      p_type = str(getattr(p, "provider_type", "chat_completion"))
+      meta_type = meta.get("type") if isinstance(meta, dict) else getattr(meta, "type", None)
+      p_type = str(
+          meta_type
+          or getattr(p, "provider_type", None)
+          or getattr(p, "type", None)
+          or p_cfg.get("provider_type")
+          or p_cfg.get("type")
+          or "chat_completion"
+      )
       if not self._is_chat_provider(p_type):
         continue
       seen_ids.add(clean_id)
+      models = _extract_models(
+          getattr(p, "models", None) or p_cfg.get("models"),
+          getattr(p, "model", None) or p_cfg.get("model"),
+      )
+      if not models and "/" in clean_id:
+        models = [clean_id.split("/", 1)[1]]
       result.append({
           "id": clean_id,
           "type": p_type,
-          "models": _extract_models(
-              getattr(p, "models", None), getattr(p, "model", None)
-          ),
+          "models": models,
           "enable": True,
       })
     return result
@@ -289,6 +329,15 @@ class GlobalModelSwitcherPlugin(Star):
           await asyncio.to_thread(func)
         return
 
+    for ctx_method in ("save_config_async", "save_config"):
+      func = getattr(self.context, ctx_method, None)
+      if callable(func):
+        if asyncio.iscoroutinefunction(func):
+          await func()
+        else:
+          await asyncio.to_thread(func)
+        return
+
     cm = getattr(self.context, "config_manager", None)
     if cm and hasattr(cm, "save_config") and callable(cm.save_config):
       await asyncio.to_thread(cm.save_config)
@@ -312,9 +361,16 @@ class GlobalModelSwitcherPlugin(Star):
       if not path:
         raise RuntimeError("无法定位 AstrBot 配置文件路径，无法保存配置")
       temp_path = f"{path}.tmp.{os.getpid()}"
-      with open(temp_path, "w", encoding="utf-8") as f:
-        json.dump(config, f, ensure_ascii=False, indent=2)
-      os.replace(temp_path, str(path))
+      try:
+        with open(temp_path, "w", encoding="utf-8") as f:
+          json.dump(config, f, ensure_ascii=False, indent=2)
+        os.replace(temp_path, str(path))
+      finally:
+        if os.path.exists(temp_path):
+          try:
+            os.remove(temp_path)
+          except OSError:
+            pass
 
     await asyncio.to_thread(_fallback_disk_write)
 
@@ -345,9 +401,18 @@ class GlobalModelSwitcherPlugin(Star):
 
   @filter.permission_type(filter.PermissionType.ADMIN)
   @filter.command("gmsw")
-  async def gmsw(self, event: AstrMessageEvent, target: str = "", *args: str):
+  async def gmsw(self, event: AstrMessageEvent, target: Optional[str] = None):
     """热切换 AstrBot 全局默认 LLM Provider（支持指定序号或 Provider ID）。"""
-    clean_target = " ".join([target, *args]).strip()
+    clean_target = (target or "").strip()
+    if event.message_str:
+      raw_msg = event.message_str.strip()
+      for cmd_prefix in ("/gmsw", "gmsw"):
+        if cmd_prefix in raw_msg:
+          idx = raw_msg.find(cmd_prefix)
+          tail = raw_msg[idx + len(cmd_prefix) :].strip()
+          if tail:
+            clean_target = tail
+            break
     if not clean_target:
       yield event.plain_result(
           "⚠️ 请指定目标 LLM Provider 的序号或 ID。\n"
@@ -368,38 +433,39 @@ class GlobalModelSwitcherPlugin(Star):
       return
 
     target_id = target_p["id"]
-    current_default = self.get_current_default_provider_id()
-    settings = self.context.config.get("provider_settings")
-    old_default = (
-        settings.get("default_provider_id", "").strip()
-        if isinstance(settings, dict)
-        else ""
-    )
+    async with self._lock:
+      settings = self.context.config.get("provider_settings")
+      old_default = (
+          settings.get("default_provider_id", "").strip()
+          if isinstance(settings, dict)
+          else ""
+      )
+      current_default = self.get_current_default_provider_id()
 
-    if target_id == current_default and old_default == target_id:
-      yield event.plain_result(
-          f"ℹ️ 当前全局默认 Provider 已经是「{target_id}」，无需重复切换。"
-      )
-      return
+      if target_id == current_default and old_default == target_id:
+        yield event.plain_result(
+            f"ℹ️ 当前全局默认 Provider 已经是「{target_id}」，无需重复切换。"
+        )
+        return
 
-    snapshot = copy.deepcopy(settings)
-    try:
-      if not isinstance(self.context.config.get("provider_settings"), dict):
-        self.context.config["provider_settings"] = {}
-      self.context.config["provider_settings"]["default_provider_id"] = (
-          target_id
-      )
-      await self._save_config_async()
-      yield event.plain_result(_build_success_message(target_p, old_default))
-    except Exception as e:
-      logger.error(
-          f"[GlobalModelSwitcher] 切换全局 Provider 异常，执行回滚: {e}",
-          exc_info=True,
-      )
-      await self._rollback_provider_settings(snapshot)
-      yield event.plain_result(
-          f"❌ 切换全局 Provider 失败！\n🚨 原因: {e}\n🛡️ 已安全回滚至修改前状态。"
-      )
+      snapshot = copy.deepcopy(settings)
+      try:
+        if not isinstance(self.context.config.get("provider_settings"), dict):
+          self.context.config["provider_settings"] = {}
+        self.context.config["provider_settings"]["default_provider_id"] = (
+            target_id
+        )
+        await self._save_config_async()
+        yield event.plain_result(_build_success_message(target_p, old_default))
+      except Exception as e:
+        logger.error(
+            f"[GlobalModelSwitcher] 切换全局 Provider 异常，执行回滚: {e}",
+            exc_info=True,
+        )
+        await self._rollback_provider_settings(snapshot)
+        yield event.plain_result(
+            f"❌ 切换全局 Provider 失败！\n🚨 原因: {e}\n🛡️ 已安全回滚至修改前状态。"
+        )
 
   async def terminate(self):
     """插件卸载清理逻辑。"""
