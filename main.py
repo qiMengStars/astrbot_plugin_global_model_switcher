@@ -123,7 +123,7 @@ def _build_success_message(target_p: Dict[str, Any], old_id: str) -> str:
     "astrbot_plugin_global_model_switcher",
     "xixi",
     "AstrBot 全局 LLM 动态热切换插件",
-    "1.0.1",
+    "1.0.2",
     "https://github.com/xixil/astrbot_plugin_global_model_switcher",
 )
 class GlobalModelSwitcherPlugin(Star):
@@ -142,6 +142,40 @@ class GlobalModelSwitcherPlugin(Star):
     self._lock: asyncio.Lock = asyncio.Lock()
     logger.info("[GlobalModelSwitcher] 全局模型切换插件已成功加载")
 
+  def _get_global_config(self) -> Optional[Any]:
+    """安全获取 AstrBot 核心全局配置对象（兼容不同版本 Context 与管理器实现）。"""
+    if hasattr(self.context, "get_config") and callable(self.context.get_config):
+      try:
+        cfg = self.context.get_config()
+        if cfg is not None:
+          return cfg
+      except Exception:
+        pass
+
+    for attr in ("_config", "config"):
+      cfg = getattr(self.context, attr, None)
+      if cfg is not None:
+        return cfg
+
+    for mgr_attr in ("astrbot_config_mgr", "config_manager"):
+      mgr = getattr(self.context, mgr_attr, None)
+      if mgr:
+        for method_name in ("get_conf", "get_config"):
+          fn = getattr(mgr, method_name, None)
+          if callable(fn):
+            try:
+              cfg = fn()
+              if cfg is not None:
+                return cfg
+            except Exception:
+              pass
+
+    pm = getattr(self.context, "provider_manager", None)
+    if pm and hasattr(pm, "provider_settings") and isinstance(pm.provider_settings, dict):
+      return {"provider_settings": pm.provider_settings}
+
+    return None
+
   def _is_chat_provider(self, provider_type: str) -> bool:
     """判定 Provider 是否为可用于对话生成的文本模型服务。"""
     normalized_type = provider_type.strip().lower()
@@ -153,7 +187,10 @@ class GlobalModelSwitcherPlugin(Star):
       self, seen_ids: Set[str], disabled_ids: Set[str]
   ) -> List[Dict[str, Any]]:
     """从全局配置中提取所有启用的对话模型 Provider。"""
-    raw = self.context.config.get("provider", [])
+    cfg = self._get_global_config()
+    if cfg is None or not hasattr(cfg, "get"):
+      return []
+    raw = cfg.get("provider") or cfg.get("providers") or []
     items = (
         raw
         if isinstance(raw, list)
@@ -270,7 +307,14 @@ class GlobalModelSwitcherPlugin(Star):
   def get_current_default_provider_id(self) -> str:
     """获取当前全局生效的 default_provider_id，未设置时回退至首项。"""
     try:
-      provider_settings = self.context.config.get("provider_settings", {})
+      cfg = self._get_global_config()
+      provider_settings = None
+      if cfg is not None and hasattr(cfg, "get"):
+        provider_settings = cfg.get("provider_settings")
+      if not provider_settings:
+        pm = getattr(self.context, "provider_manager", None)
+        if pm and hasattr(pm, "provider_settings"):
+          provider_settings = pm.provider_settings
       if isinstance(provider_settings, dict):
         default_id = provider_settings.get("default_provider_id")
         if default_id and isinstance(default_id, str) and default_id.strip():
@@ -316,18 +360,19 @@ class GlobalModelSwitcherPlugin(Star):
     ])
     return "\n".join(lines)
 
-  async def _save_config_async(self) -> None:
+  async def _save_config_async(self, config: Optional[Any] = None) -> None:
     """异步持久化保存全局配置，避免阻塞主事件循环。"""
-    config = self.context.config
+    cfg = config or self._get_global_config()
 
-    for method_name in ("save_config_async", "save_config", "save"):
-      func = getattr(config, method_name, None)
-      if callable(func):
-        if asyncio.iscoroutinefunction(func):
-          await func()
-        else:
-          await asyncio.to_thread(func)
-        return
+    if cfg is not None:
+      for method_name in ("save_config_async", "save_config", "save"):
+        func = getattr(cfg, method_name, None)
+        if callable(func):
+          if asyncio.iscoroutinefunction(func):
+            await func()
+          else:
+            await asyncio.to_thread(func)
+          return
 
     for ctx_method in ("save_config_async", "save_config"):
       func = getattr(self.context, ctx_method, None)
@@ -338,15 +383,24 @@ class GlobalModelSwitcherPlugin(Star):
           await asyncio.to_thread(func)
         return
 
-    cm = getattr(self.context, "config_manager", None)
-    if cm and hasattr(cm, "save_config") and callable(cm.save_config):
-      await asyncio.to_thread(cm.save_config)
-      return
+    for mgr_attr in ("astrbot_config_mgr", "config_manager"):
+      mgr = getattr(self.context, mgr_attr, None)
+      if mgr:
+        for mgr_save in ("save_config", "save_conf", "save"):
+          func = getattr(mgr, mgr_save, None)
+          if callable(func):
+            if asyncio.iscoroutinefunction(func):
+              await func()
+            else:
+              await asyncio.to_thread(func)
+            return
 
     def _fallback_disk_write() -> None:
+      if cfg is None:
+        raise RuntimeError("无法获取 AstrBot 配置对象，无法执行保存")
       path = (
-          getattr(config, "config_path", None)
-          or getattr(config, "_path", None)
+          getattr(cfg, "config_path", None)
+          or getattr(cfg, "_path", None)
           or getattr(self.context, "config_path", None)
       )
       if not path:
@@ -363,7 +417,7 @@ class GlobalModelSwitcherPlugin(Star):
       temp_path = f"{path}.tmp.{os.getpid()}"
       try:
         with open(temp_path, "w", encoding="utf-8") as f:
-          json.dump(config, f, ensure_ascii=False, indent=2)
+          json.dump(cfg, f, ensure_ascii=False, indent=2)
         os.replace(temp_path, str(path))
       finally:
         if os.path.exists(temp_path):
@@ -378,12 +432,20 @@ class GlobalModelSwitcherPlugin(Star):
       self, snapshot: Optional[Dict[str, Any]]
   ) -> None:
     """异常时安全还原 provider_settings 配置。"""
-    if snapshot is None:
-      self.context.config.pop("provider_settings", None)
-    else:
-      self.context.config["provider_settings"] = snapshot
+    cfg = self._get_global_config()
+    if cfg is not None and isinstance(cfg, dict):
+      if snapshot is None:
+        cfg.pop("provider_settings", None)
+      else:
+        cfg["provider_settings"] = snapshot
+
+    pm = getattr(self.context, "provider_manager", None)
+    if pm and hasattr(pm, "provider_settings") and isinstance(pm.provider_settings, dict):
+      if snapshot is not None and "default_provider_id" in snapshot:
+        pm.provider_settings["default_provider_id"] = snapshot["default_provider_id"]
+
     try:
-      await self._save_config_async()
+      await self._save_config_async(cfg)
     except Exception as rb_err:
       logger.critical(
           f"[GlobalModelSwitcher] 配置回滚保存失败: {rb_err}", exc_info=True
@@ -401,9 +463,9 @@ class GlobalModelSwitcherPlugin(Star):
 
   @filter.permission_type(filter.PermissionType.ADMIN)
   @filter.command("gmsw")
-  async def gmsw(self, event: AstrMessageEvent, target: Optional[str] = None):
+  async def gmsw(self, event: AstrMessageEvent, target: Optional[Any] = None):
     """热切换 AstrBot 全局默认 LLM Provider（支持指定序号或 Provider ID）。"""
-    clean_target = (target or "").strip()
+    clean_target = str(target).strip() if target is not None else ""
     if event.message_str:
       raw_msg = event.message_str.strip()
       for cmd_prefix in ("/gmsw", "gmsw"):
@@ -434,7 +496,15 @@ class GlobalModelSwitcherPlugin(Star):
 
     target_id = target_p["id"]
     async with self._lock:
-      settings = self.context.config.get("provider_settings")
+      cfg = self._get_global_config()
+      settings = None
+      if cfg is not None and hasattr(cfg, "get"):
+        settings = cfg.get("provider_settings")
+      if not settings:
+        pm = getattr(self.context, "provider_manager", None)
+        if pm and hasattr(pm, "provider_settings"):
+          settings = pm.provider_settings
+
       old_default = (
           settings.get("default_provider_id", "").strip()
           if isinstance(settings, dict)
@@ -448,14 +518,21 @@ class GlobalModelSwitcherPlugin(Star):
         )
         return
 
-      snapshot = copy.deepcopy(settings)
+      snapshot = copy.deepcopy(settings) if isinstance(settings, dict) else None
       try:
-        if not isinstance(self.context.config.get("provider_settings"), dict):
-          self.context.config["provider_settings"] = {}
-        self.context.config["provider_settings"]["default_provider_id"] = (
-            target_id
-        )
-        await self._save_config_async()
+        if cfg is not None and isinstance(cfg, dict):
+          if not isinstance(cfg.get("provider_settings"), dict):
+            cfg["provider_settings"] = {}
+          cfg["provider_settings"]["default_provider_id"] = target_id
+
+        pm = getattr(self.context, "provider_manager", None)
+        if pm and hasattr(pm, "provider_settings") and isinstance(pm.provider_settings, dict):
+          pm.provider_settings["default_provider_id"] = target_id
+
+        if cfg is None and (not pm or not hasattr(pm, "provider_settings")):
+          raise RuntimeError("未能定位到全局配置对象或 ProviderManager，无法修改配置")
+
+        await self._save_config_async(cfg)
         yield event.plain_result(_build_success_message(target_p, old_default))
       except Exception as e:
         logger.error(
