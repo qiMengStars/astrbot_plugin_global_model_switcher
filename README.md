@@ -4,6 +4,9 @@
 
 AstrBot 内置的 `/provider` 指令仅切换当前会话（UMO）绑定的模型，无法修改全局默认配置。本插件允许管理员在聊天中通过指令直接热切换全局默认模型（`provider_settings.default_provider_id`）并持久化到配置文件，供全局对话以及未指定独立模型的后台任务（如群分析插件、定时任务）即时采用。
 
+> [!NOTE]
+> 本项目包含极高成分vibe coding
+
 ## 功能特性
 
 - **查看列表 (`/gmls`)**：列出所有已启用的对话模型 Provider、对应模型名称与服务类型，并标记当前全局生效项。
@@ -38,15 +41,6 @@ AstrBot 内置的 `/provider` 指令仅切换当前会话（UMO）绑定的模�
 
 - **匹配优先级**：`/gmsw` 支持输入列表序号（如 `1`）或 Provider ID。若存在纯数字命名的 Provider ID，系统会优先按 ID 精确匹配，未匹配时再按序号解析。
 - **后台与跨插件任务**：依赖全局默认模型的插件（如群分析插件）或定时任务，只要其配置中的 Provider 项保持留空，切换全局模型后即可自动跟随生效。
-
-## 安装方法
-
-将本项目克隆或解压至 AstrBot 的 `data/plugins/` 目录，随后重启 AstrBot 或在 WebUI 插件管理中重新加载：
-
-```bash
-cd AstrBot/data/plugins
-git clone https://github.com/xixil/astrbot_plugin_global_model_switcher.git
-```
 
 ## 开源协议
 
