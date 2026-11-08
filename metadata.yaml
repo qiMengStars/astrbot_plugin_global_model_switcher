@@ -10,7 +10,7 @@ desc: |
   - 安全回滚：内置异常捕获与配置回滚机制，持久化失败自动还原配置。
   - 权限隔离：仅管理员有权执行查看与切换操作。
 version: 1.0.0
-author: xixi
+author: 柒梦染星河
 repo: https://github.com/xixil/astrbot_plugin_global_model_switcher
 astrbot_version: ">=4.5.0"
 tags:
