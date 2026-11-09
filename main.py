@@ -9,6 +9,14 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
 
 try:
+  from astrbot.api.provider import ProviderType
+except ImportError:
+  try:
+    from astrbot.core.provider.entities import ProviderType
+  except ImportError:
+    ProviderType = None
+
+try:
   from astrbot.api.star import register
 except ImportError:
 
@@ -185,11 +193,106 @@ def _atomic_disk_write(path: str, data: Any) -> None:
         pass
 
 
+def _extract_active_default_id(cfg: Any, pm: Any) -> str:
+  """从 ProviderManager 与全局配置中探测当前生效的默认 Provider ID。"""
+  if pm:
+    curr_inst = getattr(pm, "curr_provider_inst", None)
+    if curr_inst:
+      meta = curr_inst.meta() if callable(getattr(curr_inst, "meta", None)) else None
+      meta_id = getattr(meta, "id", None) if meta else None
+      inst_id = (
+          meta_id
+          or getattr(curr_inst, "id", None)
+          or getattr(curr_inst, "provider_config", {}).get("id")
+      )
+      if inst_id and isinstance(inst_id, str) and inst_id.strip():
+        return inst_id.strip()
+
+    default_chat_id = getattr(pm, "default_chat_provider_id", None)
+    if default_chat_id and isinstance(default_chat_id, str) and default_chat_id.strip():
+      return default_chat_id.strip()
+
+  if isinstance(cfg, dict):
+    agent_cfg = cfg.get("agent")
+    if isinstance(agent_cfg, dict):
+      sub_cfg = agent_cfg.get("config")
+      if isinstance(sub_cfg, dict):
+        model_cfg = sub_cfg.get("model")
+        if isinstance(model_cfg, dict):
+          p_id = model_cfg.get("provider_id")
+          if p_id and isinstance(p_id, str) and p_id.strip():
+            return p_id.strip()
+
+    ps = cfg.get("provider_settings")
+    if isinstance(ps, dict):
+      p_id = ps.get("default_provider_id")
+      if p_id and isinstance(p_id, str) and p_id.strip():
+        return p_id.strip()
+
+  return ""
+
+
+def _apply_config_model_change(cfg: Any, target_id: str) -> bool:
+  """同步修改全局配置字典中的现代 (v4.x+) 与兼容 (v3.x) 键值。"""
+  if not isinstance(cfg, dict):
+    return False
+
+  # 1. 现代 AstrBot 架构 (agent.config.model.provider_id)
+  if not isinstance(cfg.get("agent"), dict):
+    cfg["agent"] = {}
+  agent_cfg = cfg["agent"]
+  if not isinstance(agent_cfg.get("config"), dict):
+    agent_cfg["config"] = {}
+  sub_cfg = agent_cfg["config"]
+  if not isinstance(sub_cfg.get("model"), dict):
+    sub_cfg["model"] = {}
+  sub_cfg["model"]["provider_id"] = target_id
+
+  # 2. 兼容历史 AstrBot 架构 (provider_settings.default_provider_id)
+  if not isinstance(cfg.get("provider_settings"), dict):
+    cfg["provider_settings"] = {}
+  cfg["provider_settings"]["default_provider_id"] = target_id
+
+  return True
+
+
+async def _update_runtime_provider_manager(pm: Any, target_id: str) -> None:
+  """在 ProviderManager 中即时热更新当前活跃实例与持久偏好。"""
+  if not pm:
+    return
+
+  if hasattr(pm, "default_chat_provider_id"):
+    pm.default_chat_provider_id = target_id
+
+  pm_settings = getattr(pm, "provider_settings", None)
+  if isinstance(pm_settings, dict):
+    pm_settings["default_provider_id"] = target_id
+
+  inst_map = getattr(pm, "inst_map", None)
+  if isinstance(inst_map, dict) and target_id in inst_map:
+    pm.curr_provider_inst = inst_map[target_id]
+
+  set_fn = getattr(pm, "set_provider", None)
+  if callable(set_fn):
+    try:
+      pt = (
+          getattr(ProviderType, "CHAT_COMPLETION", "chat_completion")
+          if ProviderType
+          else "chat_completion"
+      )
+      if asyncio.iscoroutinefunction(set_fn):
+        await set_fn(target_id, pt, None)
+      else:
+        set_fn(target_id, pt, None)
+    except Exception as e:
+      logger.debug(f"[GlobalModelSwitcher] pm.set_provider 调用提示: {e}")
+
+
 @register(
     "astrbot_plugin_global_model_switcher",
     "xixi",
     "AstrBot 全局 LLM 动态热切换插件",
-    "1.0.2",
+    "1.0.3",
     "https://github.com/xixil/astrbot_plugin_global_model_switcher",
 )
 class GlobalModelSwitcherPlugin(Star):
@@ -214,6 +317,9 @@ class GlobalModelSwitcherPlugin(Star):
       mgr = getattr(self.context, mgr_attr, None)
       if not mgr:
         continue
+      confs = getattr(mgr, "confs", None)
+      if isinstance(confs, dict) and "default" in confs:
+        return confs["default"]
       for method_name in ("get_conf", "get_config"):
         fn = getattr(mgr, method_name, None)
         if not callable(fn):
@@ -228,6 +334,11 @@ class GlobalModelSwitcherPlugin(Star):
 
   def _get_global_config(self) -> Optional[Any]:
     """安全获取 AstrBot 核心全局配置对象（兼容不同版本 Context 与管理器实现）。"""
+    for attr in ("_config", "config"):
+      cfg = getattr(self.context, attr, None)
+      if cfg is not None:
+        return cfg
+
     get_cfg = getattr(self.context, "get_config", None)
     if callable(get_cfg):
       try:
@@ -236,11 +347,6 @@ class GlobalModelSwitcherPlugin(Star):
           return cfg
       except Exception:
         pass
-
-    for attr in ("_config", "config"):
-      cfg = getattr(self.context, attr, None)
-      if cfg is not None:
-        return cfg
 
     mgr_cfg = self._get_config_from_managers()
     if mgr_cfg is not None:
@@ -411,16 +517,15 @@ class GlobalModelSwitcherPlugin(Star):
     return providers
 
   def get_current_default_provider_id(self) -> str:
-    """获取当前全局生效的 default_provider_id，未设置时回退至首项。"""
+    """获取当前全局生效的 default Provider ID，未设置时回退至首项。"""
     try:
       cfg = self._get_global_config()
-      provider_settings = self._get_active_provider_settings(cfg)
-      if isinstance(provider_settings, dict):
-        default_id = provider_settings.get("default_provider_id")
-        if default_id and isinstance(default_id, str) and default_id.strip():
-          return default_id.strip()
+      pm = getattr(self.context, "provider_manager", None)
+      detected_id = _extract_active_default_id(cfg, pm)
+      if detected_id:
+        return detected_id
     except Exception as e:
-      logger.warning(f"[GlobalModelSwitcher] 读取 default_provider_id 异常: {e}")
+      logger.warning(f"[GlobalModelSwitcher] 读取 default Provider ID 异常: {e}")
 
     enabled = self.get_enabled_providers()
     return enabled[0]["id"] if enabled else ""
@@ -484,49 +589,55 @@ class GlobalModelSwitcherPlugin(Star):
 
     await asyncio.to_thread(_atomic_disk_write, path, cfg)
 
-  def _get_active_provider_settings(self, cfg: Any) -> Optional[Dict[str, Any]]:
-    """安全获取当前生效的 provider_settings 字典。"""
-    if isinstance(cfg, dict) and isinstance(cfg.get("provider_settings"), dict):
-      return cfg["provider_settings"]
-    pm = getattr(self.context, "provider_manager", None)
-    pm_settings = getattr(pm, "provider_settings", None)
-    if isinstance(pm_settings, dict):
-      return pm_settings
-    return None
-
-  def _apply_default_provider_change(self, cfg: Any, target_id: str) -> None:
-    """在全局配置和 ProviderManager 中同步应用新默认模型 ID。"""
-    has_updated = False
+  def _create_state_snapshot(
+      self, cfg: Any, pm: Any
+  ) -> Dict[str, Any]:
+    """生成用于异常安全回滚的状态快照。"""
+    snapshot: Dict[str, Any] = {
+        "agent_model_id": None,
+        "provider_settings_default_id": None,
+        "pm_default_chat_id": None,
+        "curr_inst": None,
+        "effective_id": self.get_current_default_provider_id(),
+    }
     if isinstance(cfg, dict):
-      if not isinstance(cfg.get("provider_settings"), dict):
-        cfg["provider_settings"] = {}
-      cfg["provider_settings"]["default_provider_id"] = target_id
-      has_updated = True
+      agent_cfg = cfg.get("agent")
+      if isinstance(agent_cfg, dict) and isinstance(agent_cfg.get("config"), dict):
+        model_cfg = agent_cfg["config"].get("model")
+        if isinstance(model_cfg, dict):
+          snapshot["agent_model_id"] = model_cfg.get("provider_id")
+      ps = cfg.get("provider_settings")
+      if isinstance(ps, dict):
+        snapshot["provider_settings_default_id"] = ps.get("default_provider_id")
 
-    pm = getattr(self.context, "provider_manager", None)
-    pm_settings = getattr(pm, "provider_settings", None)
-    if isinstance(pm_settings, dict):
-      pm_settings["default_provider_id"] = target_id
-      has_updated = True
+    if pm:
+      snapshot["pm_default_chat_id"] = getattr(pm, "default_chat_provider_id", None)
+      snapshot["curr_inst"] = getattr(pm, "curr_provider_inst", None)
 
-    if not has_updated:
-      raise RuntimeError("未能定位到全局配置对象或 ProviderManager，无法修改配置")
+    return snapshot
 
-  async def _rollback_provider_settings(
-      self, snapshot: Optional[Dict[str, Any]]
+  async def _rollback_state(
+      self, cfg: Any, pm: Any, snapshot: Dict[str, Any]
   ) -> None:
-    """异常时安全还原 provider_settings 配置。"""
-    cfg = self._get_global_config()
-    if cfg is not None and isinstance(cfg, dict):
-      if snapshot is None:
-        cfg.pop("provider_settings", None)
-      else:
-        cfg["provider_settings"] = snapshot
+    """回滚配置与 ProviderManager 至先前的快照状态。"""
+    if isinstance(cfg, dict):
+      old_agent_id = snapshot.get("agent_model_id")
+      if old_agent_id is not None:
+        _apply_config_model_change(cfg, old_agent_id)
+      old_ps_id = snapshot.get("provider_settings_default_id")
+      if old_ps_id is not None:
+        cfg.setdefault("provider_settings", {})["default_provider_id"] = old_ps_id
 
-    pm = getattr(self.context, "provider_manager", None)
-    pm_settings = getattr(pm, "provider_settings", None)
-    if isinstance(pm_settings, dict) and snapshot is not None and "default_provider_id" in snapshot:
-      pm_settings["default_provider_id"] = snapshot["default_provider_id"]
+    if pm:
+      old_pm_chat = snapshot.get("pm_default_chat_id")
+      if old_pm_chat is not None and hasattr(pm, "default_chat_provider_id"):
+        pm.default_chat_provider_id = old_pm_chat
+      old_inst = snapshot.get("curr_inst")
+      if old_inst is not None and hasattr(pm, "curr_provider_inst"):
+        pm.curr_provider_inst = old_inst
+      old_eff = snapshot.get("effective_id")
+      if old_eff:
+        await _update_runtime_provider_manager(pm, old_eff)
 
     try:
       await self._save_config_async(cfg)
@@ -572,31 +683,30 @@ class GlobalModelSwitcherPlugin(Star):
     target_id = target_p["id"]
     async with self._lock:
       cfg = self._get_global_config()
-      settings = self._get_active_provider_settings(cfg)
-      old_default = (
-          settings.get("default_provider_id", "").strip()
-          if isinstance(settings, dict)
-          else ""
-      )
+      pm = getattr(self.context, "provider_manager", None)
       current_default = self.get_current_default_provider_id()
 
-      if target_id == current_default and old_default == target_id:
+      if target_id == current_default:
         yield event.plain_result(
             f"ℹ️ 当前全局默认 Provider 已经是「{target_id}」，无需重复切换。"
         )
         return
 
-      snapshot = copy.deepcopy(settings) if isinstance(settings, dict) else None
+      snapshot = self._create_state_snapshot(cfg, pm)
       try:
-        self._apply_default_provider_change(cfg, target_id)
+        updated = _apply_config_model_change(cfg, target_id)
+        if not updated and not pm:
+          raise RuntimeError("未能定位到全局配置对象或 ProviderManager，无法修改配置")
+
+        await _update_runtime_provider_manager(pm, target_id)
         await self._save_config_async(cfg)
-        yield event.plain_result(_build_success_message(target_p, old_default))
+        yield event.plain_result(_build_success_message(target_p, current_default))
       except Exception as e:
         logger.error(
             f"[GlobalModelSwitcher] 切换全局 Provider 异常，执行回滚: {e}",
             exc_info=True,
         )
-        await self._rollback_provider_settings(snapshot)
+        await self._rollback_state(cfg, pm, snapshot)
         yield event.plain_result(
             f"❌ 切换全局 Provider 失败！\n🚨 原因: {e}\n🛡️ 已安全回滚至修改前状态。"
         )
