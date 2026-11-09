@@ -238,6 +238,8 @@ def _apply_config_model_change(cfg: Any, target_id: str) -> bool:
   if not isinstance(cfg.get("agent"), dict):
     cfg["agent"] = {}
   agent_cfg = cfg["agent"]
+  if not agent_cfg.get("runtime"):
+    agent_cfg["runtime"] = "astrbot"
   if not isinstance(agent_cfg.get("config"), dict):
     agent_cfg["config"] = {}
   sub_cfg = agent_cfg["config"]
@@ -251,6 +253,41 @@ def _apply_config_model_change(cfg: Any, target_id: str) -> bool:
   cfg["provider_settings"]["default_provider_id"] = target_id
 
   return True
+
+
+def _snapshot_single_config(cfg: Any) -> Dict[str, Any]:
+  """采集单个配置对象的关键字段快照。"""
+  res: Dict[str, Any] = {
+      "agent_model_id": None,
+      "agent_runtime": None,
+      "ps_default_id": None,
+  }
+  if isinstance(cfg, dict):
+    agent_cfg = cfg.get("agent")
+    if isinstance(agent_cfg, dict):
+      res["agent_runtime"] = agent_cfg.get("runtime")
+      sub_cfg = agent_cfg.get("config")
+      if isinstance(sub_cfg, dict) and isinstance(sub_cfg.get("model"), dict):
+        res["agent_model_id"] = sub_cfg["model"].get("provider_id")
+    ps = cfg.get("provider_settings")
+    if isinstance(ps, dict):
+      res["ps_default_id"] = ps.get("default_provider_id")
+  return res
+
+
+def _restore_single_config(cfg: Any, snap: Dict[str, Any]) -> None:
+  """根据快照恢复单个配置对象的关键字段。"""
+  if not isinstance(cfg, dict):
+    return
+  old_agent_id = snap.get("agent_model_id")
+  if old_agent_id is not None:
+    _apply_config_model_change(cfg, old_agent_id)
+  old_runtime = snap.get("agent_runtime")
+  if old_runtime and isinstance(cfg.get("agent"), dict):
+    cfg["agent"]["runtime"] = old_runtime
+  old_ps_id = snap.get("ps_default_id")
+  if old_ps_id is not None:
+    cfg.setdefault("provider_settings", {})["default_provider_id"] = old_ps_id
 
 
 async def _update_runtime_provider_manager(pm: Any, target_id: str) -> None:
@@ -289,7 +326,7 @@ async def _update_runtime_provider_manager(pm: Any, target_id: str) -> None:
     "astrbot_plugin_global_model_switcher",
     "xixi",
     "AstrBot 全局 LLM 动态热切换插件",
-    "1.0.3",
+    "1.0.4",
     "https://github.com/xixil/astrbot_plugin_global_model_switcher",
 )
 class GlobalModelSwitcherPlugin(Star):
@@ -586,44 +623,57 @@ class GlobalModelSwitcherPlugin(Star):
 
     await asyncio.to_thread(_atomic_disk_write, path, cfg)
 
+  def _get_default_target_configs(self) -> List[Any]:
+    """收集全局默认配置实例（仅限全局默认配置，避免过度修改隔离 Profile）。"""
+    configs: List[Any] = []
+    seen: Set[int] = set()
+
+    def _append_if_valid(c: Any) -> None:
+      if c is not None and isinstance(c, dict) and id(c) not in seen:
+        seen.add(id(c))
+        configs.append(c)
+
+    _append_if_valid(self._get_global_config())
+    for mgr_name in ("astrbot_config_mgr", "config_manager"):
+      mgr = getattr(self.context, mgr_name, None)
+      if not mgr:
+        continue
+      confs = getattr(mgr, "confs", None)
+      if isinstance(confs, dict):
+        _append_if_valid(confs.get("default"))
+      default_conf = getattr(mgr, "default_conf", None)
+      if default_conf is not None:
+        _append_if_valid(default_conf)
+
+    return configs
+
+  async def _save_all_configs_async(self, configs: List[Any]) -> None:
+    """异步保存所有被修改的配置对象与配置文件。"""
+    for cfg in configs:
+      await self._save_config_async(cfg)
+
   def _create_state_snapshot(
-      self, cfg: Any, pm: Any
+      self, configs: List[Any], pm: Any
   ) -> Dict[str, Any]:
     """生成用于异常安全回滚的状态快照。"""
     snapshot: Dict[str, Any] = {
-        "agent_model_id": None,
-        "provider_settings_default_id": None,
+        "configs": [_snapshot_single_config(c) for c in configs],
         "pm_default_chat_id": None,
         "curr_inst": None,
         "effective_id": self.get_current_default_provider_id(),
     }
-    if isinstance(cfg, dict):
-      agent_cfg = cfg.get("agent")
-      if isinstance(agent_cfg, dict) and isinstance(agent_cfg.get("config"), dict):
-        model_cfg = agent_cfg["config"].get("model")
-        if isinstance(model_cfg, dict):
-          snapshot["agent_model_id"] = model_cfg.get("provider_id")
-      ps = cfg.get("provider_settings")
-      if isinstance(ps, dict):
-        snapshot["provider_settings_default_id"] = ps.get("default_provider_id")
-
     if pm:
       snapshot["pm_default_chat_id"] = getattr(pm, "default_chat_provider_id", None)
       snapshot["curr_inst"] = getattr(pm, "curr_provider_inst", None)
-
     return snapshot
 
   async def _rollback_state(
-      self, cfg: Any, pm: Any, snapshot: Dict[str, Any]
+      self, configs: List[Any], pm: Any, snapshot: Dict[str, Any]
   ) -> None:
     """回滚配置与 ProviderManager 至先前的快照状态。"""
-    if isinstance(cfg, dict):
-      old_agent_id = snapshot.get("agent_model_id")
-      if old_agent_id is not None:
-        _apply_config_model_change(cfg, old_agent_id)
-      old_ps_id = snapshot.get("provider_settings_default_id")
-      if old_ps_id is not None:
-        cfg.setdefault("provider_settings", {})["default_provider_id"] = old_ps_id
+    cfg_snaps = snapshot.get("configs", [])
+    for cfg, snap in zip(configs, cfg_snaps):
+      _restore_single_config(cfg, snap)
 
     if pm:
       old_pm_chat = snapshot.get("pm_default_chat_id")
@@ -637,7 +687,7 @@ class GlobalModelSwitcherPlugin(Star):
         await _update_runtime_provider_manager(pm, old_eff)
 
     try:
-      await self._save_config_async(cfg)
+      await self._save_all_configs_async(configs)
     except Exception as rb_err:
       logger.critical(
           f"[GlobalModelSwitcher] 配置回滚保存失败: {rb_err}", exc_info=True
@@ -676,7 +726,7 @@ class GlobalModelSwitcherPlugin(Star):
 
     target_id = target_p["id"]
     async with self._lock:
-      cfg = self._get_global_config()
+      target_configs = self._get_default_target_configs()
       pm = getattr(self.context, "provider_manager", None)
       current_default = self.get_current_default_provider_id()
 
@@ -686,21 +736,25 @@ class GlobalModelSwitcherPlugin(Star):
         )
         return
 
-      snapshot = self._create_state_snapshot(cfg, pm)
+      snapshot = self._create_state_snapshot(target_configs, pm)
       try:
-        updated = _apply_config_model_change(cfg, target_id)
-        if not updated and not pm:
+        updated_any = False
+        for cfg in target_configs:
+          if _apply_config_model_change(cfg, target_id):
+            updated_any = True
+
+        if not updated_any and not pm:
           raise RuntimeError("未能定位到全局配置对象或 ProviderManager，无法修改配置")
 
         await _update_runtime_provider_manager(pm, target_id)
-        await self._save_config_async(cfg)
+        await self._save_all_configs_async(target_configs)
         yield event.plain_result(_build_success_message(target_p, current_default))
       except Exception as e:
         logger.error(
             f"[GlobalModelSwitcher] 切换全局 Provider 异常，执行回滚: {e}",
             exc_info=True,
         )
-        await self._rollback_state(cfg, pm, snapshot)
+        await self._rollback_state(target_configs, pm, snapshot)
         yield event.plain_result(
             f"❌ 切换全局 Provider 失败！\n🚨 原因: {e}\n🛡️ 已安全回滚至修改前状态。"
         )
