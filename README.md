@@ -2,7 +2,7 @@
 
 适用于 [AstrBot](https://github.com/Soulter/AstrBot) 的全局默认大语言模型（LLM Provider）动态切换插件。
 
-AstrBot 内置的 `/provider` 指令仅切换当前会话（UMO）绑定的模型，无法修改全局默认配置。本插件允许管理员在聊天中通过指令直接热切换全局默认模型（`provider_settings.default_provider_id`）并持久化到配置文件，供全局对话以及未指定独立模型的后台任务（如群分析插件、定时任务）即时采用。
+AstrBot 内置的 `/provider` 指令仅切换当前会话（UMO）绑定的模型，无法修改全局默认配置。本插件允许管理员在聊天中通过指令直接热切换全局默认模型并持久化到配置文件，供全局对话以及未指定独立模型的后台任务（如群分析插件、定时任务）即时采用。
 
 > [!NOTE]
 > 本项目包含极高成分vibe coding

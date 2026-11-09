@@ -120,9 +120,6 @@ def _build_success_message(target_p: Dict[str, Any], old_id: str) -> str:
       f"🤖 对应模型  : {models_str}",
       f"🏷️ 服务类型  : {target_p.get('type', '未知')}",
       "------------------------------------",
-      "💾 全局配置文件已持久化，重启保持有效。",
-      "⚡ 内存热更新即时生效，无单独锁定模型的后台任务与插件（如群分析）将自动接入新模型。",
-      "💡 提示：若群分析插件需跟随此全局模型，请确保其插件配置中的模型提供商项保持留空。",
   ])
 
 
@@ -663,10 +660,7 @@ class GlobalModelSwitcherPlugin(Star):
     clean_target = _extract_command_target(target, getattr(event, "message_str", None))
     if not clean_target:
       yield event.plain_result(
-          "⚠️ 请指定目标 LLM Provider 的序号或 ID。\n"
-          "📌 用法: /gmsw <序号或ID>\n"
-          "👉 示例: /gmsw 1 或 /gmsw deepseek_chat\n"
-          "💡 可发送 /gmls 查看可用列表。"
+          "⚠️ 请指定目标 LLM Provider 的序号或 ID（示例: /gmsw 1 或 /gmsw deepseek_chat，可发送 /gmls 查看列表）。"
       )
       return
 
