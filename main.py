@@ -45,7 +45,7 @@ def _find_target_provider(
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
   """根据用户输入的 Provider ID 或序号查找目标 Provider。"""
   if not providers:
-    return None, "⚠️ 当前没有已启用的 Provider 可供切换。"
+    return None, "当前没有已启用的 Provider 可供切换。"
 
   matched = [p for p in providers if p["id"] == target]
   if matched:
@@ -60,34 +60,27 @@ def _find_target_provider(
     if 1 <= idx <= len(providers):
       return providers[idx - 1], None
     return None, (
-        f"⚠️ 序号超出范围！有效序号为 1 到 {len(providers)}。\n"
-        "💡 请发送 /gmls 查看可用 Provider 序号。"
+        f"序号超出范围，有效序号为 1 到 {len(providers)}。发送 /gmls 查看列表。"
     )
 
-  return None, (
-      f"⚠️ 未找到 ID 为「{target}」的可用 Provider！\n"
-      "💡 请发送 /gmls 查看当前启用的 Provider ID 列表。"
-  )
+  return None, f"未找到 ID 为 {target} 的可用 Provider。发送 /gmls 查看列表。"
 
 
 def _build_success_message(
     target_p: Dict[str, Any], old_id: Optional[str]
 ) -> str:
-  """生成切换成功的提示文本，保持直观整洁。"""
+  """生成切换成功的提示文本。"""
   p_id = target_p["id"]
   models = target_p.get("models", [])
   models_str = " / ".join(models) if models else "默认模型"
   p_type = target_p.get("type", "未知")
 
   return "\n".join([
-      "🎉【全局默认 LLM Provider 切换成功】",
-      "--------------------",
-      f"🔄 原默认 ID : {old_id or '未显式指定'}",
-      f"🎯 新默认 ID : {p_id}",
-      f"🤖 对应模型 : {models_str}",
-      f"🏷 服务类型 : {p_type}",
-      "--------------------",
-      "ℹ️ 仅影响使用默认 Provider 的会话与后台任务；已单独指定 Provider 的插件不受影响。",
+      "全局默认 Provider 已切换",
+      f"原默认 ID: {old_id or '未显式指定'}",
+      f"新默认 ID: {p_id}",
+      f"模型: {models_str}",
+      f"类型: {p_type}",
   ])
 
 
@@ -120,7 +113,7 @@ def _extract_id_from_agent_section(cfg: Dict[str, Any], key: str) -> str:
 def _extract_id_from_cfg(cfg: Any) -> str:
   """从配置对象中提取当前生效的默认对话模型 ID。
 
-  现代 AstrBot 的解析器只读 agent.config.model.provider_id；旧版字段仅作兼容兜底。
+  现代 AstrBot 的解析器只读 agent.config.model.provider_id，旧版字段只在没有 agent 段时使用。
   """
   if not isinstance(cfg, dict):
     return ""
@@ -216,12 +209,12 @@ def _restore_single_config(cfg: Any, snapshot: Dict[str, Any]) -> None:
 @register(
     "astrbot_plugin_global_model_switcher",
     "xixi",
-    "AstrBot 全局 LLM 动态热切换插件",
-    "1.0.6",
+    "AstrBot 全局 LLM Provider 切换插件",
+    "1.0.7",
     "https://github.com/xixil/astrbot_plugin_global_model_switcher",
 )
 class GlobalModelSwitcherPlugin(Star):
-  """AstrBot 全局默认 LLM 动态热切换插件。"""
+  """AstrBot 全局默认 LLM Provider 切换插件。"""
 
   def __init__(
       self,
@@ -231,7 +224,7 @@ class GlobalModelSwitcherPlugin(Star):
     super().__init__(context)
     self.config = config or {}
     self._lock = asyncio.Lock()
-    logger.info("[GlobalModelSwitcher] 全局模型切换插件已加载 (v1.0.6)")
+    logger.info("[GlobalModelSwitcher] 全局模型切换插件已加载 (v1.0.7)")
 
   def _get_global_config(self) -> Optional[Any]:
     """获取 AstrBot 的全局默认配置对象，不回退到会话 profile。"""
@@ -438,40 +431,27 @@ class GlobalModelSwitcherPlugin(Star):
   ) -> str:
     """格式化 Provider 列表为可读文本消息。"""
     if not providers:
-      return (
-          "⚠️ 当前未检测到任何已启用的对话型 LLM Provider！\n"
-          "💡 请先在 AstrBot WebUI「服务提供商」中配置并启用至少一个模型服务。"
-      )
+      return "未检测到已启用的对话型 LLM Provider，请先在 WebUI 的「服务提供商」中配置并启用。"
 
-    lines: List[str] = [
-        "🤖 【AstrBot 全局可用 LLM Provider 列表】",
-        "------------------------------------",
-    ]
+    lines: List[str] = ["全局可用 LLM Provider 列表"]
     for idx, p in enumerate(providers, start=1):
       p_id = p["id"]
       models = p.get("models", [])
       models_str = " / ".join(models) if models else "默认模型"
       is_current = p_id == current_default_id
-      prefix = "* " if is_current else "  "
       status_tag = " (当前全局默认)" if is_current else ""
-      lines.extend([
-          f"{prefix}[{idx}] {p_id}{status_tag}",
-          f"      ├─ 模型: {models_str}",
-          f"      └─ 类型: {p.get('type', '未知')}",
-      ])
+      lines.append(f"[{idx}] {p_id}{status_tag}  模型: {models_str}  类型: {p.get('type', '未知')}")
 
     lines.extend([
-        "------------------------------------",
-        f"📌 当前全局生效 ID: {current_default_id or '未显式指定'}",
-        "💡 快捷切换方式: /gmsw <序号或ID>",
-        "   例如: /gmsw 1 或 /gmsw deepseek_chat",
+        f"当前全局生效 ID: {current_default_id or '未显式指定'}",
+        "切换方式: /gmsw <序号或ID>，例如 /gmsw 1 或 /gmsw deepseek_chat",
     ])
     return "\n".join(lines)
 
   async def _save_config_async(self, config: Any) -> None:
     """调用配置对象自带的持久化接口，保留其原子写与版本校验。"""
     if not isinstance(config, dict):
-      raise RuntimeError("无法获取 AstrBot 配置对象，无法执行保存")
+      raise RuntimeError("无法获取 AstrBot 配置对象，无法保存")
 
     save_async = getattr(config, "save_config_async", None)
     if callable(save_async):
@@ -559,30 +539,25 @@ class GlobalModelSwitcherPlugin(Star):
   async def _execute_model_switch(
       self, event: AstrMessageEvent, target_p: Dict[str, Any]
   ):
-    """执行切换、持久化与异常回滚。"""
+    """切换配置并持久化，失败时回滚。"""
     target_id = target_p["id"]
     async with self._lock:
       pm = getattr(self.context, "provider_manager", None)
       inst_map = getattr(pm, "inst_map", None)
       if isinstance(inst_map, dict) and target_id not in inst_map:
         yield event.plain_result(
-            f"⚠️ Provider「{target_id}」当前未成功加载，无法切换。\n"
-            "💡 请先在 WebUI 检查该 Provider 的配置并重载，再发送 /gmls 确认。"
+            f"Provider {target_id} 未加载成功，无法切换。请先在 WebUI 检查其配置并重载。"
         )
         return
 
       target_configs = self._get_default_target_configs()
       if not target_configs:
-        yield event.plain_result(
-            "⚠️ 未能定位 AstrBot 全局配置对象，无法切换。"
-        )
+        yield event.plain_result("未能定位全局配置对象，无法切换。")
         return
 
       current_default = self.get_current_default_provider_id()
       if target_id == current_default:
-        yield event.plain_result(
-            f"ℹ️ 当前全局默认 Provider 已经是「{target_id}」，无需重复切换。"
-        )
+        yield event.plain_result(f"当前全局默认 Provider 已是 {target_id}，无需切换。")
         return
 
       snapshot = self._create_state_snapshot(target_configs, pm)
@@ -601,18 +576,16 @@ class GlobalModelSwitcherPlugin(Star):
         yield event.plain_result(_build_success_message(target_p, current_default))
       except Exception as e:
         logger.error(
-            f"[GlobalModelSwitcher] 切换全局 Provider 异常，执行回滚: {e}",
+            f"[GlobalModelSwitcher] 切换全局 Provider 失败，回滚配置: {e}",
             exc_info=True,
         )
         rollback_saved = await self._rollback_state(target_configs, pm, snapshot)
         if rollback_saved:
-          rollback_hint = "🛡️ 已回滚至修改前状态并重新保存。"
+          rollback_hint = "配置已回滚并重新保存。"
         else:
-          rollback_hint = (
-              "🚨 回滚后的保存也失败了，配置可能仍未恢复，请手动检查配置文件。"
-          )
+          rollback_hint = "回滚后的保存同样失败，配置可能未恢复，请手动检查配置文件。"
         yield event.plain_result(
-            f"❌ 切换全局 Provider 失败！\n🚨 原因: {e}\n{rollback_hint}"
+            f"切换全局 Provider 失败: {e}\n{rollback_hint}"
         )
 
   @filter.permission_type(filter.PermissionType.ADMIN)
@@ -622,18 +595,18 @@ class GlobalModelSwitcherPlugin(Star):
     clean_target = _extract_command_target(target)
     if not clean_target:
       yield event.plain_result(
-          "⚠️ 请指定目标 LLM Provider 的序号或 ID（示例: /gmsw 1 或 /gmsw deepseek_chat，可发送 /gmls 查看列表）。"
+          "请指定目标 Provider 的序号或 ID，例如 /gmsw 1 或 /gmsw deepseek_chat，发送 /gmls 查看列表。"
       )
       return
 
     providers = self.get_enabled_providers()
     if not providers:
-      yield event.plain_result("⚠️ 未检索到任何已启用的对话型 LLM Provider，无法切换。")
+      yield event.plain_result("未检索到已启用的对话型 LLM Provider，无法切换。")
       return
 
     target_p, err_msg = _find_target_provider(clean_target, providers)
     if err_msg or not target_p:
-      yield event.plain_result(err_msg or "⚠️ 未找到目标 Provider。")
+      yield event.plain_result(err_msg or "未找到目标 Provider。")
       return
 
     async for result in self._execute_model_switch(event, target_p):
